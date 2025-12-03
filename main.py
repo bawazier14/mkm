@@ -66,7 +66,6 @@ def update_order_status(order_id, status_code):
     return api_request({'action': 'set_status', 'order_id': order_id, 'status': status_code})
 
 def get_balance():
-    # [cite_start]Mengambil info saldo [cite: 2]
     return api_request({'action': 'getBalance'})
 
 def is_authorized(user_id):
@@ -136,10 +135,38 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error(f"App Error: {context.error}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id): return
+    user_id = update.effective_user.id
+    
+    # Cek Auth
+    if not is_authorized(user_id):
+        if update.effective_message:
+            await update.effective_message.reply_text("❌ Maaf, Anda tidak diizinkan.")
+        return
+
     context.user_data['state'] = None
-    keyboard = [[InlineKeyboardButton("📱 Regular", callback_data="list_reg")], [InlineKeyboardButton("🌟 Spesial", callback_data="list_spec")], [InlineKeyboardButton("💰 Cek Saldo", callback_data="cek_saldo")]]
-    await update.message.reply_text(f"🤖 **OTP Bot Ready**\nID Negara: {DEFAULT_COUNTRY_ID}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    
+    keyboard = [
+        [InlineKeyboardButton("📱 Layanan Regular", callback_data="list_reg")],
+        [InlineKeyboardButton("🌟 Layanan Spesial", callback_data="list_spec")],
+        [InlineKeyboardButton("💰 Cek Saldo", callback_data="cek_saldo")]
+    ]
+    
+    text = (
+        "🤖 **Halo! Selamat Datang di Bot OTP.**\n"
+        f"Country ID Aktif: {DEFAULT_COUNTRY_ID}\n\n"
+        "Silakan pilih menu di bawah ini:"
+    )
+    
+    # --- LOGIKA PINTAR: DETEKSI TOMBOL VS KETIKAN ---
+    if update.callback_query:
+        # Jika dipanggil dari tombol (misal: "Kembali"), EDIT pesan
+        try:
+            await update.callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        except Exception:
+            pass 
+    elif update.message:
+        # Jika dipanggil dari ketikan /start, KIRIM pesan baru
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -216,28 +243,15 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update_order_status(oid, code)
         await query.edit_message_text("✅ Transaksi Selesai." if action == "fin" else "🚫 Dibatalkan.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="menu_utama")]]))
 
-    # --- UPDATE: FITUR CEK SALDO LENGKAP ---
     elif data == "cek_saldo":
         await query.edit_message_text("🔄 Mengambil info akun...")
         res = get_balance()
         if check_api_success(res):
             data_saldo = res.get('data', {})
             saldo = data_saldo.get('saldo', '0')
-            # Gunakan .get() agar tidak error jika field email kosong
-            email = data_saldo.get('email', 'Tidak ada email') 
-            
-            # [cite_start]Tampilkan Email dan Saldo sesuai request [cite: 2]
-            text_info = (
-                f"👤 **Info Akun**\n"
-                f"📧 Email: `{email}`\n"
-                f"💰 Saldo: **Rp {saldo}**"
-            )
-            
-            await query.edit_message_text(
-                text_info, 
-                parse_mode='Markdown', 
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu_utama")]])
-            )
+            email = data_saldo.get('email', 'Tidak ada email')
+            text_info = f"👤 **Info Akun**\n📧 Email: `{email}`\n💰 Saldo: **Rp {saldo}**"
+            await query.edit_message_text(text_info, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu_utama")]]))
         else:
             await query.edit_message_text(f"❌ Gagal: {res.get('msg')}")
 
@@ -261,10 +275,14 @@ async def handle_search_input(update: Update, context: ContextTypes.DEFAULT_TYPE
 # --- MAIN ---
 def main():
     if not BOT_TOKEN:
-        logger.error("❌ Token Missing")
+        logger.error("❌ TELEGRAM_BOT_TOKEN tidak ditemukan!")
+        exit(1)
+    
+    if not OTP_API_KEY:
+        logger.error("❌ OTP_API_KEY tidak ditemukan!")
         exit(1)
 
-    logger.info("🚀 Starting Bot on Railway...")
+    logger.info("🚀 Starting Bot on Railway (Polling Mode)...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     
     app.add_handler(CommandHandler('start', start))
