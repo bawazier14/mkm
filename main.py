@@ -245,7 +245,9 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "cek_saldo":
         res = get_balance()
         if check_api_success(res):
-            await query.edit_message_text(f"💰 Saldo: **Rp {res['data']['saldo']}**", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu_utama")]]))
+            saldo = res['data']['saldo']
+            email = res['data']['email']
+            await query.edit_message_text(f"👤 Akun: {email}\n💰 Saldo: **Rp {saldo}**", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu_utama")]]))
         else:
             await query.edit_message_text(f"❌ Gagal: {res.get('msg')}")
 
@@ -296,3 +298,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
