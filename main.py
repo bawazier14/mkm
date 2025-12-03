@@ -14,12 +14,10 @@ from telegram.ext import (
 )
 
 # --- KONFIGURASI SISTEM ---
-# Di Railway, kita ambil semua dari Environment Variable
 BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 OTP_API_KEY = os.environ.get('OTP_API_KEY')
 BASE_URL = os.environ.get('OTP_BASE_URL', 'https://otpcepat.org/api/handler_api.php')
 
-# Parsing Allowed Users (Mencegah error jika env kosong)
 allowed_users_env = os.environ.get('ALLOWED_USERS', '1017778214,2096488866')
 try:
     ALLOWED_USERS = list(map(int, allowed_users_env.split(',')))
@@ -30,7 +28,6 @@ DEFAULT_COUNTRY_ID = os.environ.get('DEFAULT_COUNTRY_ID', '6')
 DEFAULT_OPERATOR_ID = os.environ.get('DEFAULT_OPERATOR_ID', 'random')
 ITEMS_PER_PAGE = 10 
 
-# Setup Logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
@@ -39,30 +36,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- FUNGSI API (BACKEND) ---
-
 def api_request(params):
-    """Wrapper untuk memanggil API dengan retry mechanism"""
-    max_retries = 3
-    retry_delay = 2
-    
-    for attempt in range(max_retries):
-        try:
-            params['api_key'] = OTP_API_KEY
-            response = requests.get(BASE_URL, params=params, timeout=20)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.Timeout:
-            logger.warning(f"Timeout attempt {attempt + 1}/{max_retries}")
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay)
-        except Exception as e:
-            logger.error(f"API Error: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay)
-            else:
-                return {"status": "false", "msg": f"Error: {str(e)}"}
-    
-    return {"status": "false", "msg": "Gagal koneksi ke server OTP."}
+    try:
+        params['api_key'] = OTP_API_KEY
+        response = requests.get(BASE_URL, params=params, timeout=20)
+        return response.json()
+    except Exception as e:
+        logger.error(f"API Error: {e}")
+        return {"status": "false", "msg": "API Error"}
 
 def check_api_success(response):
     status = response.get('status')
@@ -71,21 +52,12 @@ def check_api_success(response):
 def fetch_services(type='regular'):
     action = 'getServices' if type == 'regular' else 'getSpecialServices'
     params = {'action': action}
-    if type == 'regular':
-        params['country_id'] = DEFAULT_COUNTRY_ID
-
+    if type == 'regular': params['country_id'] = DEFAULT_COUNTRY_ID
     data = api_request(params)
-    if check_api_success(data):
-        return data.get('data', [])
-    return []
+    return data.get('data', []) if check_api_success(data) else []
 
 def order_number(service_id):
-    return api_request({
-        'action': 'get_order',
-        'service_id': service_id,
-        'operator_id': DEFAULT_OPERATOR_ID,
-        'country_id': DEFAULT_COUNTRY_ID
-    })
+    return api_request({'action': 'get_order', 'service_id': service_id, 'operator_id': DEFAULT_OPERATOR_ID, 'country_id': DEFAULT_COUNTRY_ID})
 
 def check_order_sms(order_id):
     return api_request({'action': 'get_status', 'order_id': order_id})
@@ -94,113 +66,106 @@ def update_order_status(order_id, status_code):
     return api_request({'action': 'set_status', 'order_id': order_id, 'status': status_code})
 
 def get_balance():
+    # [cite_start]Mengambil info saldo [cite: 2]
     return api_request({'action': 'getBalance'})
 
 def is_authorized(user_id):
     return user_id in ALLOWED_USERS
 
-# --- HELPER UI ---
+# --- JOB QUEUE (AUTO CHECKER) ---
+async def auto_check_sms_job(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    order_id = job.data['order_id']
+    chat_id = job.data['chat_id']
+    
+    resp = check_order_sms(order_id)
+    
+    if check_api_success(resp):
+        d = resp.get('data', {})
+        sms = d.get('sms')
+        status = d.get('status')
+        
+        if sms:
+            logger.info(f"SMS Diterima untuk Order {order_id}")
+            text_sms = f"📩 **SMS MASUK!** (ID: {order_id})\n\n`{sms}`\n\nSilakan gunakan kode tersebut."
+            kb = [[InlineKeyboardButton("✅ Selesai", callback_data=f"fin_{order_id}"), InlineKeyboardButton("🚫 Batalkan", callback_data=f"cncl_{order_id}")]]
+            await context.bot.send_message(chat_id=chat_id, text=text_sms, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+            job.schedule_removal()
+        elif status == 'Canceled' or status == 'Refunded':
+            await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Order {order_id} dibatalkan oleh sistem/timeout.")
+            job.schedule_removal()
+    else:
+        pass
 
+def stop_auto_check(context, order_id):
+    current_jobs = context.job_queue.get_jobs_by_name(str(order_id))
+    for job in current_jobs:
+        job.schedule_removal()
+
+# --- HELPER UI ---
 def get_pagination_keyboard(services, page, list_type):
+    import math
     total_items = len(services)
     total_pages = math.ceil(total_items / ITEMS_PER_PAGE)
-    
     start = page * ITEMS_PER_PAGE
     end = start + ITEMS_PER_PAGE
     current_items = services[start:end]
-    
     keyboard = []
     row = []
     for item in current_items:
         name = item['serviceName'][:20]
         price = item['price']
         sid = item['serviceID']
-        btn_text = f"{name} ({price})"
-        row.append(InlineKeyboardButton(btn_text, callback_data=f"buy_{sid}"))
+        row.append(InlineKeyboardButton(f"{name} ({price})", callback_data=f"buy_{sid}"))
         if len(row) == 2:
             keyboard.append(row)
             row = []
-    if row: 
-        keyboard.append(row)
-        
+    if row: keyboard.append(row)
     nav_row = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton("⬅️", callback_data=f"nav_{list_type}_{page-1}"))
-    
+    if page > 0: nav_row.append(InlineKeyboardButton("⬅️", callback_data=f"nav_{list_type}_{page-1}"))
     nav_row.append(InlineKeyboardButton(f"📄 {page+1}/{total_pages}", callback_data="noop"))
-    
-    if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton("➡️", callback_data=f"nav_{list_type}_{page+1}"))
-        
+    if page < total_pages - 1: nav_row.append(InlineKeyboardButton("➡️", callback_data=f"nav_{list_type}_{page+1}"))
     keyboard.append(nav_row)
-    
     if list_type != 'filtered':
-        keyboard.append([InlineKeyboardButton("🔍 Cari Layanan (Ketik)", callback_data=f"start_search_{list_type}")])
-    
+        keyboard.append([InlineKeyboardButton("🔍 Cari", callback_data=f"start_search_{list_type}")])
     keyboard.append([InlineKeyboardButton("🏠 Menu Utama", callback_data="menu_utama")])
     return InlineKeyboardMarkup(keyboard)
 
 # --- HANDLERS ---
-# (Bagian handler ini sama persis, logika bot tidak berubah)
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(f"Exception: {context.error}")
+    logger.error(f"App Error: {context.error}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_authorized(user_id):
-        await update.message.reply_text("❌ Maaf, Anda tidak diizinkan.")
-        return
-
+    if not is_authorized(update.effective_user.id): return
     context.user_data['state'] = None
-    keyboard = [
-        [InlineKeyboardButton("📱 Layanan Regular", callback_data="list_reg")],
-        [InlineKeyboardButton("🌟 Layanan Spesial", callback_data="list_spec")],
-        [InlineKeyboardButton("💰 Cek Saldo", callback_data="cek_saldo")]
-    ]
-    text = f"🤖 **Halo! Selamat Datang.**\nCountry ID: {DEFAULT_COUNTRY_ID}\nSilakan pilih menu:"
-    
-    if update.callback_query:
-        await update.callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-    else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    keyboard = [[InlineKeyboardButton("📱 Regular", callback_data="list_reg")], [InlineKeyboardButton("🌟 Spesial", callback_data="list_spec")], [InlineKeyboardButton("💰 Cek Saldo", callback_data="cek_saldo")]]
+    await update.message.reply_text(f"🤖 **OTP Bot Ready**\nID Negara: {DEFAULT_COUNTRY_ID}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    
     if not is_authorized(user_id):
-        await query.answer("❌ Ditolak.", show_alert=True)
+        await query.answer("Ditolak.", show_alert=True)
         return
-
     await query.answer()
     data = query.data
     
-    # --- LOGIKA TOMBOL (Versi Ringkas tapi Lengkap) ---
     if data == "menu_utama":
         await start(update, context)
     
     elif data in ["list_reg", "list_spec"]:
-        list_type = 'regular' if data == "list_reg" else 'special'
-        short_code = 'reg' if data == "list_reg" else 'spec'
-        await query.edit_message_text("🔄 Mengambil data...")
-        services = fetch_services(list_type)
-        if not services:
-            await query.edit_message_text("❌ Data kosong.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu_utama")]]))
-            return
-        context.user_data[f'services_{short_code}'] = services
-        markup = get_pagination_keyboard(services, 0, short_code)
-        await query.edit_message_text(f"📋 **Layanan ({list_type.title()}):**", reply_markup=markup, parse_mode='Markdown')
+        sc = 'reg' if data == "list_reg" else 'spec'
+        lt = 'regular' if data == "list_reg" else 'special'
+        await query.edit_message_text("🔄 Loading...")
+        srv = fetch_services(lt)
+        context.user_data[f'services_{sc}'] = srv
+        await query.edit_message_text(f"📋 **{lt.title()}**", reply_markup=get_pagination_keyboard(srv, 0, sc), parse_mode='Markdown')
 
     elif data.startswith("nav_"):
-        _, type_code, page_num = data.split("_")
-        page = int(page_num)
-        services = context.user_data.get(f'services_{type_code}')
-        if services:
-            markup = get_pagination_keyboard(services, page, type_code)
-            try: await query.edit_message_text(f"📋 **Daftar Layanan:**", reply_markup=markup, parse_mode='Markdown')
-            except: pass
-        else:
-            await query.edit_message_text("⚠️ Sesi habis.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="menu_utama")]]))
+        _, t, p = data.split("_")
+        await query.edit_message_text("📋 List:", reply_markup=get_pagination_keyboard(context.user_data.get(f'services_{t}'), int(p), t), parse_mode='Markdown')
 
     elif data.startswith("start_search_"):
         target_type = data.split("_")[2]
@@ -214,9 +179,15 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         resp = order_number(sid)
         if check_api_success(resp):
             d = resp.get('data', {})
-            txt = f"✅ **Order Berhasil!**\n📱 `{d.get('number')}`\n🆔 `{d.get('order_id')}`\n💰 {d.get('price')}"
-            kb = [[InlineKeyboardButton("🔄 Cek SMS", callback_data=f"chk_{d.get('order_id')}")], [InlineKeyboardButton("✅ Selesai", callback_data=f"fin_{d.get('order_id')}"), InlineKeyboardButton("🚫 Batal", callback_data=f"cncl_{d.get('order_id')}")]]
+            order_id = d.get('order_id')
+            txt = (f"✅ **Order Berhasil!**\n📱 `{d.get('number')}`\n🆔 `{order_id}`\n💰 {d.get('price')}\n\n"
+                   f"⏳ **Menunggu SMS Otomatis...**\nBot akan mengecek setiap 5 detik.")
+            kb = [[InlineKeyboardButton("🔄 Cek Manual", callback_data=f"chk_{order_id}")], 
+                  [InlineKeyboardButton("✅ Selesai", callback_data=f"fin_{order_id}"), InlineKeyboardButton("🚫 Batal", callback_data=f"cncl_{order_id}")]]
             await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+            
+            # Start Auto Check Job
+            context.job_queue.run_repeating(auto_check_sms_job, interval=5, first=2, data={'order_id': order_id, 'chat_id': chat_id}, name=str(order_id))
         else:
             await query.edit_message_text(f"❌ Gagal: {resp.get('msg')}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu_utama")]]))
 
@@ -227,9 +198,11 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             d = resp.get('data', {})
             sms = d.get('sms')
             status = d.get('status', 'Unknown')
-            if sms: msg = f"📩 **SMS MASUK!**\n`{sms}`"
-            elif status == 'Recieved': msg = "📩 SMS DITERIMA! Cek aplikasi."
-            else: msg = f"⏳ Status: {status}\nBelum ada SMS."
+            if sms: 
+                msg = f"📩 **SMS MASUK!**\n`{sms}`"
+                stop_auto_check(context, oid)
+            else: 
+                msg = f"⏳ Status: {status}\nBelum ada SMS (Auto-check aktif)."
         else: msg = f"⚠️ Error: {resp.get('msg')}"
         kb = [[InlineKeyboardButton("🔄 Cek Lagi", callback_data=f"chk_{oid}")], [InlineKeyboardButton("✅ Selesai", callback_data=f"fin_{oid}"), InlineKeyboardButton("🚫 Batal", callback_data=f"cncl_{oid}")]]
         try: await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
@@ -237,17 +210,34 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("fin_") or data.startswith("cncl_"):
         action, oid = data.split("_")
+        stop_auto_check(context, oid)
         code = 4 if action == "fin" else 2
         await query.edit_message_text("🔄 Updating...")
         update_order_status(oid, code)
         await query.edit_message_text("✅ Transaksi Selesai." if action == "fin" else "🚫 Dibatalkan.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="menu_utama")]]))
 
+    # --- UPDATE: FITUR CEK SALDO LENGKAP ---
     elif data == "cek_saldo":
+        await query.edit_message_text("🔄 Mengambil info akun...")
         res = get_balance()
         if check_api_success(res):
-            saldo = res['data']['saldo']
-            email = res['data']['email']
-            await query.edit_message_text(f"👤 Akun: {email}\n💰 Saldo: **Rp {saldo}**", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu_utama")]]))
+            data_saldo = res.get('data', {})
+            saldo = data_saldo.get('saldo', '0')
+            # Gunakan .get() agar tidak error jika field email kosong
+            email = data_saldo.get('email', 'Tidak ada email') 
+            
+            # [cite_start]Tampilkan Email dan Saldo sesuai request [cite: 2]
+            text_info = (
+                f"👤 **Info Akun**\n"
+                f"📧 Email: `{email}`\n"
+                f"💰 Saldo: **Rp {saldo}**"
+            )
+            
+            await query.edit_message_text(
+                text_info, 
+                parse_mode='Markdown', 
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu_utama")]])
+            )
         else:
             await query.edit_message_text(f"❌ Gagal: {res.get('msg')}")
 
@@ -268,34 +258,21 @@ async def handle_search_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         await update.message.reply_text("Ketik /start untuk menu.")
 
-# --- MAIN (RAILWAY READY) ---
-
+# --- MAIN ---
 def main():
     if not BOT_TOKEN:
-        logger.error("❌ TELEGRAM_BOT_TOKEN tidak ditemukan! Cek Variables Railway.")
-        exit(1)
-    
-    if not OTP_API_KEY:
-        logger.error("❌ OTP_API_KEY tidak ditemukan! Cek Variables Railway.")
+        logger.error("❌ Token Missing")
         exit(1)
 
-    logger.info("🚀 Starting Bot on Railway (Polling Mode)...")
-    logger.info(f"📊 Allowed Users Count: {len(ALLOWED_USERS)}")
-
-    # Build Application
+    logger.info("🚀 Starting Bot on Railway...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     
-    # Handlers
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CallbackQueryHandler(handle_buttons))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search_input))
     app.add_error_handler(error_handler)
     
-    logger.info("✅ Bot Started! Waiting for updates...")
-    
-    # Run Polling (Mode Paling Stabil untuk Railway Worker)
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
-
